@@ -67,6 +67,7 @@ LD_LIBRARY_PATH="$LLAMA_DIR/lib" \
     -t "$LLAMA_THREADS" \
     -tb "$LLAMA_BATCH_THREADS" \
     --port "$LLAMA_PORT" \
+    --ui-mcp-proxy
     > "$LLAMA_LOG" 2>&1 &
 
 # ── Generate input conf with resolved paths ─────────────────────────

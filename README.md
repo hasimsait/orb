@@ -48,15 +48,22 @@ orb/
 ├── orb_hover.sh        # Script: switch to hover animation
 ├── orb_leave.sh        # Script: switch to idle animation
 ├── orb_action.sh       # Script: click handler (chat launch)
-├── client.py         # LLM chat client (streaming, tool-use, leveled logging)
-├── log.py              # Leveled logger — writes to ORB_LOG_FILE
+├── client.py           # LLM chat client (streaming, tool-use, leveled logging)
+├── requirements.txt    # Python dependencies (mcp, pytest)
 ├── system_prompt.txt   # System prompt for the LLM
 ├── idle.gif            # Animation: idle state
 ├── hover.gif           # Animation: mouse hover state
 └── output.gif          # Animation: thinking/action state
 ```
 
-### 2. Make scripts executable
+### 2. Install Python dependencies
+
+```bash
+pip install -r ~/.config/orb/requirements.txt
+```
+
+### 3. Make scripts executable
+
 
 ```bash
 chmod +x ~/.config/orb/*.sh
@@ -94,8 +101,26 @@ Any server that implements this endpoint will work. Some options:
 The chat client supports:
 - Streaming responses (SSE)
 - Reasoning/thinking tokens (displayed dimmed)
-- Tool calling (`web_search_exa`, `web_fetch_exa`)
+- Dynamic Tool Calling via hybrid MCP router (`streamable-http` & `sse`)
 - Structured logging to file (see [Debugging](#debugging))
+
+### Hybrid MCP Tool Router (`OrbToolRouter`)
+
+The client features `OrbToolRouter`, a hybrid MCP client manager built on the official `mcp` Python SDK. It connects to multiple remote MCP servers, aggregates their tools into standard OpenAI function schemas, and routes execution requests.
+
+Configure servers in `mcp_servers.json`:
+
+```json
+[
+  {
+    "id": "exa-search-mcp",
+    "type": "streamable-http",
+    "url": "https://mcp.exa.ai/mcp"
+  }
+]
+```
+
+Transports supported: `streamable-http` and `sse`.
 
 ### Customizing the Personality
 

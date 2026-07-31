@@ -1,13 +1,82 @@
-#!/usr/bin/env python3
+import asyncio
 import json
 import os
 import re
 import sys
+import threading
 import traceback
 import urllib.parse
 import urllib.request
 from enum import Enum, auto
-from log import log, ERROR, WARN, DEBUG, TRACE
+import logging
+
+# Standard logging configuration replacing log.py
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
+
+ERROR = logging.ERROR
+WARN = logging.WARNING
+DEBUG = logging.DEBUG
+
+
+def _setup_logger():
+    logger = logging.getLogger("orb")
+
+    level_str = os.environ.get("ORB_LOG", "error").lower()
+    level_map = {
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "warning": logging.WARNING,
+        "debug": logging.DEBUG,
+        "trace": TRACE,
+    }
+    log_level = level_map.get(level_str, logging.ERROR)
+    logger.setLevel(log_level)
+
+    if logger.handlers:
+        return logger
+
+    log_path = os.environ.get("ORB_LOG_FILE", "/tmp/orb.log")
+    try:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        formatter = logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)5s] %(message)s",
+            datefmt="%H:%M:%S"
+        )
+        fh.setFormatter(formatter)
+        fh.setLevel(log_level)
+        logger.addHandler(fh)
+    except OSError as err:
+        print(f"[orb/log] Cannot open log file {log_path!r}: {err}",
+              file=sys.stderr, flush=True)
+
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setLevel(logging.ERROR)
+    sh.setFormatter(logging.Formatter("[ERROR] %(message)s"))
+    logger.addHandler(sh)
+
+    # Ensure mcp SDK logs are routed through our handlers
+    mcp_logger = logging.getLogger("mcp")
+    mcp_logger.setLevel(log_level)
+    for h in logger.handlers:
+        mcp_logger.addHandler(h)
+    mcp_logger.propagate = False
+
+    return logger
+
+
+logger = _setup_logger()
+
+
+def log(level, msg):
+    """Write msg to standard logger at level."""
+    logger.log(level, msg)
+
+
+try:
+    from orb_tool_router import OrbToolRouter
+except ImportError:
+    OrbToolRouter = None
 
 # ==============================================================================
 # CONFIGURATION & CONSTANTS
@@ -69,20 +138,63 @@ DEFAULT_TOOLS = [
 ]
 
 # ==============================================================================
-# TOOL EXECUTORS (MCP Handshake & Fallbacks)
+# TOOL EXECUTORS (MCP Router & Fallbacks)
 # ==============================================================================
 
 
 class ToolManager:
+    _mcp_router = None
+    _mcp_loop = None
+    _mcp_thread = None
+
+    @classmethod
+    def _run_loop(cls, loop):
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    @classmethod
+    def get_router(cls):
+        """Returns initialized OrbToolRouter instance if configured."""
+        if cls._mcp_router is None and OrbToolRouter is not None:
+            config_path = os.path.join(
+                os.path.dirname(__file__), "mcp_servers.json")
+            if os.path.exists(config_path):
+                try:
+                    cls._mcp_loop = asyncio.new_event_loop()
+                    cls._mcp_thread = threading.Thread(
+                        target=cls._run_loop, args=(cls._mcp_loop,), daemon=True)
+                    cls._mcp_thread.start()
+
+                    router = OrbToolRouter(config_path)
+                    future = asyncio.run_coroutine_threadsafe(
+                        router.initialize(), cls._mcp_loop)
+                    future.result()  # Wait for initialization to complete
+                    cls._mcp_router = router
+                except Exception as e:
+                    log(WARN, f"Failed to load MCP router config: {e}")
+        return cls._mcp_router
+
     @staticmethod
     def execute(name, args_str):
-        """Routes tool calls to the appropriate handler."""
+        """Routes tool calls to the appropriate handler (OrbToolRouter or legacy handlers)."""
         try:
             args = json.loads(args_str) if args_str.strip() else {}
         except Exception:
             args = {}
 
         log(DEBUG, f"Tool routing: {name}  args={args_str[:120]}")
+
+        # Check if active OrbToolRouter can execute this tool
+        router = ToolManager.get_router()
+        if router and name in router._routes:
+            try:
+                log(DEBUG, f"Executing via OrbToolRouter: {name}")
+                future = asyncio.run_coroutine_threadsafe(
+                    router.execute_tool(name, args), ToolManager._mcp_loop)
+                result = future.result()
+                return str(result)
+            except Exception as e:
+                log(WARN, f"OrbToolRouter execution failed for {name}: {e}")
 
         if name in ("web_search_exa", "web_fetch_exa"):
             result = ToolManager._call_exa_mcp(name, args)
@@ -145,7 +257,8 @@ class ToolManager:
             if name == "web_search_exa":
                 args = dict(args)
                 try:
-                    args["numResults"] = max(1, min(int(args.get("numResults", 3)), 3))
+                    args["numResults"] = max(
+                        1, min(int(args.get("numResults", 3)), 3))
                 except (ValueError, TypeError):
                     args["numResults"] = 3
 
@@ -214,17 +327,22 @@ class ToolManager:
                         if isinstance(item, dict):
                             title = item.get("title", "")
                             url = item.get("url", "")
-                            snip = str(item.get("text") or item.get("highlights") or item.get("snippet") or "")
+                            snip = str(item.get("text") or item.get(
+                                "highlights") or item.get("snippet") or "")
                             if len(snip) > max_chars_per_result:
-                                snip = snip[:max_chars_per_result].rsplit(' ', 1)[0] + " … [truncated]"
-                            processed.append(f"Title: {title}\nURL: {url}\nSummary: {snip}")
+                                snip = snip[:max_chars_per_result].rsplit(
+                                    ' ', 1)[0] + " … [truncated]"
+                            processed.append(
+                                f"Title: {title}\nURL: {url}\nSummary: {snip}")
                         else:
                             s = str(item)
                             if len(s) > max_chars_per_result:
-                                s = s[:max_chars_per_result].rsplit(' ', 1)[0] + " … [truncated]"
+                                s = s[:max_chars_per_result].rsplit(
+                                    ' ', 1)[0] + " … [truncated]"
                             processed.append(s)
                     res = "\n\n---\n\n".join(processed)
-                    log(DEBUG, f"Processed Exa JSON search output: {orig_len} → {len(res)} chars ({len(processed)} results)")
+                    log(DEBUG,
+                        f"Processed Exa JSON search output: {orig_len} → {len(res)} chars ({len(processed)} results)")
                     return res
             except Exception:
                 pass
@@ -238,19 +356,22 @@ class ToolManager:
                 r'\n+(?=#+\s)',
                 r'\n+(?=\d+\.\s)'
             ]:
-                parts = [p.strip() for p in re.split(pattern, text) if p.strip()]
+                parts = [p.strip()
+                         for p in re.split(pattern, text) if p.strip()]
                 if len(parts) > 1:
                     items = parts
                     break
 
             if not items:
                 # No delimiters found; split by paragraphs
-                items = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
+                items = [p.strip()
+                         for p in re.split(r'\n\n+', text) if p.strip()]
 
             processed = []
             for item in items[:max_results]:
                 if len(item) > max_chars_per_result:
-                    item = item[:max_chars_per_result].rsplit(' ', 1)[0] + " … [truncated]"
+                    item = item[:max_chars_per_result].rsplit(
+                        ' ', 1)[0] + " … [truncated]"
                 processed.append(item)
 
             res = "\n\n---\n\n".join(processed)
@@ -258,10 +379,12 @@ class ToolManager:
             if len(res) > max_total:
                 res = res[:max_total].rsplit(' ', 1)[0] + " … [truncated]"
 
-            log(DEBUG, f"Processed Exa text search output: {orig_len} → {len(res)} chars ({len(processed)} results)")
+            log(DEBUG,
+                f"Processed Exa text search output: {orig_len} → {len(res)} chars ({len(processed)} results)")
             return res
         except Exception as e:
-            log(WARN, f"Failed to process Exa search output ({e}), truncating raw string")
+            log(WARN,
+                f"Failed to process Exa search output ({e}), truncating raw string")
             max_total = max_results * max_chars_per_result
             return text[:max_total] + " … [truncated]" if len(text) > max_total else text
 
@@ -532,10 +655,19 @@ class ChatSession:
 
     def stream_turn(self):
         """Handles a single network request to the local LLM and streams the result."""
+        router = ToolManager.get_router()
+        tools_list = list(DEFAULT_TOOLS)
+        if router and router.tools:
+            tools_list = []
+            existing_names = {t["function"]["name"] for t in tools_list}
+            for rt in router.tools:
+                if rt["function"]["name"] not in existing_names:
+                    tools_list.append(rt)
+
         request_body = {
             "messages": self.messages,
             "stream": True,
-            "tools": DEFAULT_TOOLS,
+            "tools": tools_list,
             "chat_template_kwargs": {"enable_thinking": True},
         }
 
